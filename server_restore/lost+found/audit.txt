@@ -1,0 +1,11 @@
+Foremost version 1.5.7 by Jesse Kornblum, Kris Kendall, and Nick Mikus
+Audit File
+
+Foremost started at Wed Jul 29 18:34:01 2020
+Invocation: ./foremost -T /data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan 
+Output directory: /data/lyh/lab/foremost-1.5.7/output_Wed_Jul_29_18_34_01_2020
+Configuration file: /data/lyh/lab/foremost-1.5.7/foremost.conf
+
+0 FILES EXTRACTED
+	
+------------------------------------------
