@@ -1,35 +1,38 @@
 import tensorflow as tf
 import numpy as np
 from loading_input import *
-from pointnetvlad.pointnetvlad_cls import *
+from pointnetvlad.pointnet_cls import *
 import pointnetvlad.loupe as lp
-import nets.resnetvlad_v1_50 as resnet
+import nets.resnet_v1_50 as resnet
 import shutil
 from multiprocessing.dummy import Pool as ThreadPool
 import threading
 import time
-import cv2
+#import cv2
 sys.path.append('/data/lyh/lab/robotcar-dataset-sdk/python')
 from camera_model import CameraModel
 from transform import build_se3_transform
 import matplotlib.pyplot as plt
-import tensorflow.contrib.slim as slim
+
+from RandLANet.helper_tool import ConfigRobotCar as cfg
+from RandLANet import RandLANet
+from helper_tool import DataProcessing as DP
 
 
 
 #thread pool
-pool = ThreadPool(1)
+pool = ThreadPool(5)
 
 # is rand init 
-RAND_INIT = False
+RAND_INIT = True
 # model path
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_fusion/model_00180060.ckpt"
+PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_performance_compare/log/train_save_trans_exp_6_4/pc_model_00441147.ckpt"
+IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_performance_compare/log/train_save_trans_exp_6_5/img_model_00441147.ckpt"
 # log path
-LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_14_2"
+LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_2_0"
 # 1 for point cloud only, 2 for image only, 3 for pc&img&fc
-TRAINING_MODE = 3
+TRAINING_MODE = 1
 #TRAIN_ALL = True
 ONLY_TRAIN_FUSION = False
 
@@ -59,9 +62,9 @@ MARGIN1 = 0.5
 MARGIN2 = 0.2
 
 #Train file index & pc img matching
-TRAIN_FILE = 'generate_queries/training_queries_RobotCar_day.pickle'
+TRAIN_FILE = 'generate_queries/training_queries_RobotCar_randlanet.pickle'
 TRAINING_QUERIES = get_queries_dict(TRAIN_FILE)
-TEST_FILE = 'generate_queries/test_queries_RobotCar_day.pickle'
+TEST_FILE = 'generate_queries/test_queries_RobotCar_randlanet.pickle'
 TEST_QUERIES = get_queries_dict(TEST_FILE)
 
 #cur_load for get_batch_keys
@@ -83,21 +86,6 @@ EP = 0
 #camera model and posture
 CAMERA_MODEL = None
 G_CAMERA_POSESOURCE = None
-
-def channel_wise_attention(feature_map, weight_decay=0.00004, scope='', reuse=None):
-	with tf.variable_scope(scope, 'ChannelWiseAttention', reuse=reuse):
-		# Tensorflow's tensor is in BHWC format. H for row split while W for column split.
-		_, C = tuple([int(x) for x in feature_map.get_shape()])
-		
-		w_s = tf.get_variable("ChannelWiseAttention_w_s", [C, C],dtype=tf.float32,initializer=tf.initializers.orthogonal,regularizer=tf.contrib.layers.l2_regularizer(weight_decay))
-		b_s = tf.get_variable("ChannelWiseAttention_b_s", [C],dtype=tf.float32,initializer=tf.initializers.zeros)
-		
-		#transpose_feature_map = tf.transpose(tf.reduce_mean(feature_map, [1, 2], keep_dims=True), perm=[0, 3, 1, 2])
-		channel_wise_attention_fm = tf.matmul(feature_map, w_s) + b_s
-		channel_wise_attention_fm = tf.nn.sigmoid(channel_wise_attention_fm)
-		attended_fm = channel_wise_attention_fm * feature_map
-	
-	return attended_fm
 
 def init_camera_model_posture():
 	global CAMERA_MODEL
@@ -139,29 +127,92 @@ def get_bn_decay(step):
 	bn_decay = tf.minimum(BN_DECAY_CLIP, 0.875)
 	return bn_decay
 
-def init_imgnetwork(is_training = True):
+def init_imgnetwork():
 	with tf.variable_scope("img_var"):
 		img_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,240,320,3])
-		img_feat = resnet.endpoints(img_placeholder,is_training=is_training)
-		img_feat = tf.nn.l2_normalize(img_feat,1)
+		_, img_feat_after_pooling, body_prefix = resnet.endpoints(img_placeholder,is_training=True)
+		#img_feat = tf.layers.dense(img_feat_after_pooling, EMBBED_SIZE,activation=tf.nn.relu)
+		img_feat = tf.nn.l2_normalize(img_feat_after_pooling,1)
 	return img_placeholder, img_feat
+
+
+def knn_search(database,query,k):
+	#divided into batch
+	database_point_shape = database.get_shape()[1]
+	query_point_shape = query.get_shape()[1]
+	
+	database = tf.expand_dims(database,axis=1)
+	query = tf.expand_dims(query,axis=2)
+	database = tf.tile(database,multiples=[1,query_point_shape,1,1])
+	query = tf.tile(query,multiples=[1,1,database_point_shape,1])
+	
+	distance = query - database
+	distance = tf.reduce_sum(tf.square(distance),3)
+	_,top_k = tf.nn.top_k(distance,k)
+	
+	'''
+	print(database)
+	print(query)
+	print(distance)
+	print(top_k)
+	'''
+	return top_k
+	
+	
 	
 def init_pcnetwork(step):
 	with tf.variable_scope("pc_var"):
+		pc_dict = dict()
 		pc_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,4096,3])
+		
+		#img_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,1024,3])
+		
+		
+		#knn_search(pc_placeholder,img_placeholder,5)
+		
 		is_training_pl = tf.placeholder(tf.bool, shape=())
-		bn_decay = get_bn_decay(step)
-		pc_feat = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)
-		#pc_feat = tf.layers.dense(pc_feat_after_shape, EMBBED_SIZE,activation=tf.nn.relu)
+		
+		input_points = []
+		input_neighbors = []
+		input_pools = []
+		input_up_samples = []
+		
+		batch_xyz = pc_placeholder
+		features = pc_placeholder
+		for i in range(cfg.num_layers):
+			neighbour_idx = knn_search(batch_xyz,batch_xyz,cfg.k_n)
+			#neighbour_idx = tf.py_func(DP.knn_search, [batch_xyz, batch_xyz, cfg.k_n], tf.int32)	
+			sub_points = pc_placeholder[:, :tf.shape(batch_xyz)[1] // cfg.sub_sampling_ratio[i], :]
+			pool_i = neighbour_idx[:, :tf.shape(batch_xyz)[1] // cfg.sub_sampling_ratio[i], :]
+			up_i = knn_search(sub_points,batch_xyz,1)
+			#up_i = tf.py_func(DP.knn_search, [sub_points, batch_xyz, 1], tf.int32)
+			
+			input_points.append(batch_xyz)
+			input_neighbors.append(neighbour_idx)
+			input_pools.append(pool_i)
+			input_up_samples.append(up_i)
+			batch_xyz = sub_points
+		
+		pc_dict['xyz'] = input_points
+		pc_dict['is_training'] = is_training_pl
+		pc_dict['neigh_idx'] = input_neighbors
+		pc_dict['sub_idx'] = input_pools
+		pc_dict['interp_idx'] = input_up_samples
+		pc_dict['features'] = features
+		
+		rand_net = RandLANet.Network(pc_dict, cfg)
+		print(rand_net.pc_feat)
+		pc_feat = rand_net.pc_feat
+		print(pc_feat)
+		exit()
+		
 	return pc_placeholder,is_training_pl,pc_feat
 	
-def init_fusion_network(pc_feat,img_feat,is_training=True):
+def init_fusion_network(pc_feat,img_feat):
 	with tf.variable_scope("fusion_var"):
 		pcai_feat = tf.concat((pc_feat,img_feat),axis=1)
-				
-		#pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
-		
-		pcai_feat = tf.nn.l2_normalize(pcai_feat,1)
+		#pcai_feat = tf.layers.dense(concat_feat,EMBBED_SIZE,activation=tf.nn.relu)
+		print(pcai_feat)
 	return pcai_feat
 
 def init_pcainetwork():
@@ -170,19 +221,17 @@ def init_pcainetwork():
 	
 	#init sub-network
 	if TRAINING_MODE != 2:
-		pc_placeholder, is_training_pl, pc_feat = init_pcnetwork(step)
+		pc_placeholder,is_training_pl,pc_feat = init_pcnetwork(step)
 	if TRAINING_MODE != 1:
 		img_placeholder, img_feat = init_imgnetwork()
 	if TRAINING_MODE == 3:
 		pcai_feat = init_fusion_network(pc_feat,img_feat)
 	
-	print(pc_feat)
-	print(img_feat)
-	print(pcai_feat)
-	
 	#prepare data and loss
 	if TRAINING_MODE != 2:
-		pc_feat = tf.reshape(pc_feat,[FEAT_BATCH_SIZE,BATCH_DATA_SIZE,pc_feat.shape[1]])
+		#pc_feat = tf.reshape(pc_feat,[FEAT_BATCH_SIZE,BATCH_DATA_SIZE,pc_feat.shape[1]])
+		pc_feat = tf.reshape(pc_feat,[-1,BATCH_DATA_SIZE,pc_feat.shape[1]])
+		
 		q_pc_vec, pos_pc_vec, neg_pc_vec, oth_pc_vec = tf.split(pc_feat, [1,POS_NUM,NEG_NUM,OTH_NUM],1)
 		pc_loss = lazy_quadruplet_loss(q_pc_vec, pos_pc_vec, neg_pc_vec, oth_pc_vec, MARGIN1, MARGIN2)
 		tf.summary.scalar('pc_loss', pc_loss)
@@ -244,7 +293,7 @@ def init_pcainetwork():
 	#output of pcainetwork init
 	if TRAINING_MODE == 1:
 		ops = {
-			"is_training_pl":is_training_pl,
+			#"is_training_pl":is_training_pl,
 			"pc_placeholder":pc_placeholder,
 			"epoch_num_placeholder":epoch_num_placeholder,
 			"pc_loss":pc_loss,
@@ -265,7 +314,7 @@ def init_pcainetwork():
 		
 	if TRAINING_MODE == 3 and ONLY_TRAIN_FUSION:
 		ops = {
-			"is_training_pl":is_training_pl,
+			#"is_training_pl":is_training_pl,
 			"pc_placeholder":pc_placeholder,
 			"img_placeholder":img_placeholder,
 			"epoch_num_placeholder":epoch_num_placeholder,
@@ -282,7 +331,7 @@ def init_pcainetwork():
 		
 	if TRAINING_MODE == 3:
 		ops = {
-			"is_training_pl":is_training_pl,
+			#"is_training_pl":is_training_pl,
 			"pc_placeholder":pc_placeholder,
 			"img_placeholder":img_placeholder,
 			"epoch_num_placeholder":epoch_num_placeholder,
@@ -355,8 +404,17 @@ def init_train_saver():
 	
 	return train_saver
 	
-def prepare_batch_data(pc_data,img_data,feat_batch,ops,ep):
+def prepare_batch_data(cur_batch_data,feat_batch,ops,ep):
 	is_training = True
+	
+	randlanet_data['features'] = out_feat
+	randlanet_data['xyz'] = out_pc
+	randlanet_data['neigh_idx'] = neigh_idx
+	randlanet_data['sub_idx'] = pool_i
+	randlanet_data['interp_idx'] = up_idx
+	randlanet_data['img_data'] = img_data
+	
+	
 	if TRAINING_MODE != 2:
 		feat_batch_pc = pc_data[feat_batch*BATCH_DATA_SIZE*FEAT_BATCH_SIZE:(feat_batch+1)*BATCH_DATA_SIZE*FEAT_BATCH_SIZE]
 	if TRAINING_MODE != 1:
@@ -390,17 +448,17 @@ def prepare_batch_data(pc_data,img_data,feat_batch,ops,ep):
 def train_one_step(sess,ops,train_feed_dict,train_writer,is_training = True):
 	global STEP
 	if not is_training:
-		summary,step,all_loss = sess.run([ops["merged"],ops["step"],ops["all_loss"]],feed_dict = train_feed_dict)
+		summary,step,all_loss = sess.run([ops["merged"],ops["step"],ops["pc_loss"]],feed_dict = train_feed_dict)
 		train_writer.add_summary(summary, step)
 		return step,all_loss
 	
 	if TRAINING_MODE == 1:
-		summary,step,pc_loss,_,= sess.run([ops["merged"],ops["step"],ops["pc_loss"],ops["pc_train_op"]],feed_dict = train_feed_dict)
-		print("batch num = %d , pc_loss = %f"%(step, pc_loss))
+		summary,step,all_loss,_,= sess.run([ops["merged"],ops["step"],ops["pc_loss"],ops["pc_train_op"]],feed_dict = train_feed_dict)
+		print("batch num = %d , pc_loss = %f"%(step, all_loss))
 
 	if TRAINING_MODE == 2:
-		summary,step,img_loss,_,= sess.run([ops["merged"],ops["step"],ops["img_loss"],ops["img_train_op"]],feed_dict = train_feed_dict)
-		print("batch num = %d , img_loss = %f"%(step, img_loss))
+		summary,step,all_loss,_,= sess.run([ops["merged"],ops["step"],ops["img_loss"],ops["img_train_op"]],feed_dict = train_feed_dict)
+		print("batch num = %d , img_loss = %f"%(step, all_loss))
 	
 	if TRAINING_MODE == 3:
 		if ONLY_TRAIN_FUSION:
@@ -451,9 +509,11 @@ def is_negative(query,not_negative):
 def get_eval_batch_filename(eval_batch_key,quadruplet):
 	pc_files = []
 	img_files = []
+	pc_kdtree_files = []
 	for key_cnt ,key in enumerate(eval_batch_key):
 		pc_files.append(TEST_QUERIES[key]["query"])
 		img_files.append("%s_stereo_centre.png"%(TEST_QUERIES[key]["query"][:-4]))
+		pc_kdtree_files.append("%s_KDTree.pkl"%(TEST_QUERIES[key]["query"][:-4]))
 		random.shuffle(TEST_QUERIES[key]["positives"])
 
 		cur_pos = 0;
@@ -472,6 +532,7 @@ def get_eval_batch_filename(eval_batch_key,quadruplet):
 					exit()
 			
 			pc_files.append(TEST_QUERIES[TEST_QUERIES[key]["positives"][cur_pos]]["query"])
+			pc_kdtree_files.append("%s_KDTree.pkl"%(TEST_QUERIES[TEST_QUERIES[key]["positives"][cur_pos]]["query"][:-4]))
 			img_files.append(filename)		
 		
 		neg_indices = []
@@ -491,6 +552,7 @@ def get_eval_batch_filename(eval_batch_key,quadruplet):
 					
 			neg_indices.append(neg_ind)
 			pc_files.append(TEST_QUERIES[neg_ind]["query"])
+			pc_kdtree_files.append("%s_KDTree.pkl"%(TEST_QUERIES[neg_ind]["query"][:-4]))
 			img_files.append(filename)
 		
 		'''
@@ -517,23 +579,26 @@ def get_eval_batch_filename(eval_batch_key,quadruplet):
 						break						
 									
 			pc_files.append(TEST_QUERIES[neg_ind]["query"])
+			pc_kdtree_files.append("%s_KDTree.pkl"%(TEST_QUERIES[neg_ind]["query"][:-4]))
 			img_files.append(filename)
 	
 	if TRAINING_MODE == 1:
-		return pc_files,None
+		return pc_files,pc_kdtree_files,None
 	
 	if TRAINING_MODE == 2:
-		return None,img_files
+		return None,None,img_files
 		
 	if TRAINING_MODE == 3:
-		return pc_files,img_files
+		return pc_files,pc_kdtree_files,img_files
 	
 def get_load_batch_filename(load_batch_keys,quadruplet):		
 	pc_files = []
 	img_files = []
+	pc_kdtree_files = []
 	for key_cnt ,key in enumerate(load_batch_keys):
 		pc_files.append(TRAINING_QUERIES[key]["query"])
 		img_files.append("%s_stereo_centre.png"%(TRAINING_QUERIES[key]["query"][:-4]))
+		pc_kdtree_files.append("%s_KDTree.pkl"%(TRAINING_QUERIES[key]["query"][:-4]))
 		random.shuffle(TRAINING_QUERIES[key]["positives"])
 		
 		#print(TRAINING_QUERIES[key])
@@ -553,7 +618,8 @@ def get_load_batch_filename(load_batch_keys,quadruplet):
 					exit()
 			
 			pc_files.append(TRAINING_QUERIES[TRAINING_QUERIES[key]["positives"][cur_pos]]["query"])
-			img_files.append(filename)		
+			img_files.append(filename)
+			pc_kdtree_files.append("%s_KDTree.pkl"%(TRAINING_QUERIES[TRAINING_QUERIES[key]["positives"][cur_pos]]["query"][:-4]))
 		
 		neg_indices = []
 		for i in range(NEG_NUM):
@@ -573,6 +639,7 @@ def get_load_batch_filename(load_batch_keys,quadruplet):
 			neg_indices.append(neg_ind)
 			pc_files.append(TRAINING_QUERIES[neg_ind]["query"])
 			img_files.append(filename)
+			pc_kdtree_files.append("%s_KDTree.pkl"%(TRAINING_QUERIES[neg_ind]["query"][:-4]))
 		
 		'''
 		tmp_list = img_files[9*(key_cnt)+1+POS_NUM:9*(key_cnt)+1+POS_NUM+NEG_NUM]
@@ -599,15 +666,17 @@ def get_load_batch_filename(load_batch_keys,quadruplet):
 									
 			pc_files.append(TRAINING_QUERIES[neg_ind]["query"])
 			img_files.append(filename)
+			pc_kdtree_files.append("%s_KDTree.pkl"%(TRAINING_QUERIES[neg_ind]["query"][:-4]))
+			
 	
 	if TRAINING_MODE == 1:
-		return pc_files,None
+		return pc_files,pc_kdtree_files,None
 	
 	if TRAINING_MODE == 2:
-		return None,img_files
+		return None,None,img_files
 		
 	if TRAINING_MODE == 3:
-		return pc_files,img_files
+		return pc_files,pc_kdtree_files,img_files
 	
 def get_eval_keys():
 	eval_file_num = len(TEST_QUERIES.keys())
@@ -683,6 +752,37 @@ def get_batch_keys(train_file_idxs,train_file_num):
 		CUR_LOAD = CUR_LOAD + 1
 		
 	return False,load_batch_keys
+
+def cal_randlanet_data(pc_data,kdtree_data,img_data):
+	out_pc = []
+	neigh_idx = []
+	pool_idx = []
+	up_idx = []
+	cur_pc = pc_data
+	for i in range(cfg.num_layers):
+		neighbour_idx = DP.knn_search(cur_pc,cur_pc,cfg.k_n)
+		sub_points = pc_data[:, :cur_pc.shape[1] // cfg.sub_sampling_ratio[i+1], :]
+		pool_i = neighbour_idx[:, :cur_pc.shape[1] // cfg.sub_sampling_ratio[i+1], :]
+		up_i = DP.knn_search(sub_points,cur_pc,1)
+		print(up_i.shape)
+		
+		out_pc.append(cur_pc)
+		neigh_idx.append(neighbour_idx)
+		pool_idx.append(pool_i)
+		up_idx.append(up_i)
+		cur_pc = sub_points
+	
+	out_feat = pc_data
+	
+	randlanet_data = dict()
+	randlanet_data['features'] = out_feat
+	randlanet_data['xyz'] = out_pc
+	randlanet_data['neigh_idx'] = neigh_idx
+	randlanet_data['sub_idx'] = pool_i
+	randlanet_data['interp_idx'] = up_idx
+	randlanet_data['img_data'] = img_data
+	
+	return randlanet_data
 	
 def load_data(train_file_idxs):
 	global BATCH_REACH_END
@@ -704,9 +804,13 @@ def load_data(train_file_idxs):
 			is_training = False
 			_,eval_batch_key = get_eval_keys()
 			#select load_batch tuple
-			eval_pc_filenames,eval_img_filenames = get_eval_batch_filename(eval_batch_key,quadruplet)
-			#load pc&img data from file
-			pc_data,img_data = load_img_pc(eval_pc_filenames,eval_img_filenames,pool,True)
+			eval_pc_filenames,eval_pc_kdtree_filenames,eval_img_filenames = get_eval_batch_filename(eval_batch_key,quadruplet)
+			print(eval_pc_filenames)
+			print(eval_pc_kdtree_filenames)
+			print(eval_img_filenames)
+			#load pc&img&kdtree data from file
+			pc_data,kdtree_data,img_data = load_img_pc_kdtree(eval_pc_filenames,eval_pc_kdtree_filenames,eval_img_filenames,pool,True)
+			randla_data = cal_randlanet_data(pc_data,kdtree_data,img_data)
 			
 			print("load evaluate batch",cnt)
 		else:	
@@ -715,15 +819,16 @@ def load_data(train_file_idxs):
 				print("load thread ended---------------------------------------------------------------------------------------------------")
 				break
 			#select load_batch tuple
-			load_pc_filenames,load_img_filenames = get_load_batch_filename(load_batch_keys,quadruplet)
-		
-			#load pc&img data from file
-			#pc_data,img_data = load_img_pc_from_net(load_pc_filenames,load_img_filenames,pool)
-			pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool,True)
+			#modify 20200824 for randlanet
+			load_pc_filenames,load_pc_kdtree_filenames,load_img_filenames = get_load_batch_filename(load_batch_keys,quadruplet)
+			exit()
+			#load pc&img&kdtree data from file
+			pc_data,kdtree_data,img_data = load_img_pc_kdtree(load_pc_filenames,load_pc_kdtree_filenames,load_img_filenames,pool,True)
+			randla_data = cal_randlanet_data(pc_data,kdtree_data,img_data)
 			print("load training batch",cnt)
 		
 		TRAINING_DATA_LOCK.acquire()
-		TRAINING_DATA.append([pc_data,img_data,is_training])
+		TRAINING_DATA.append(randla_data)
 		TRAINING_DATA_LOCK.release()
 		
 		cnt = cnt + 1	
@@ -772,16 +877,13 @@ def training(sess,train_saver,train_writer,eval_writer,ops):
 		cur_batch_data = TRAINING_DATA[0]
 		del(TRAINING_DATA[0])
 		TRAINING_DATA_LOCK.release()
-		pc_data = cur_batch_data[0]
-		img_data = cur_batch_data[1]
-		is_training = cur_batch_data[2]
 				
 		print("consume one batch")
 				
 		if(is_training):
 			for feat_batch in range(LOAD_FEAT_RATIO):
 				#prepare this batch data
-				train_feed_dict = prepare_batch_data(pc_data,img_data,feat_batch,ops,EP)
+				train_feed_dict = prepare_batch_data(cur_batch_data,feat_batch,ops,EP)
 												
 				#training
 				step,all_loss = train_one_step(sess,ops,train_feed_dict,train_writer,is_training)
@@ -806,6 +908,7 @@ def main():
 	
 	#init network pipeline
 	ops = init_pcainetwork()
+	exit()
 	
 	#init train saver
 	train_saver = init_train_saver()
@@ -818,13 +921,13 @@ def main():
 	#init tensorflow Session
 	with tf.Session(config=config) as sess:
 		#init all the variable
-		init_network_variable(sess,train_saver)
-		train_writer = tf.summary.FileWriter(os.path.join(LOG_PATH, 'train'), sess.graph)
-		eval_writer = tf.summary.FileWriter(os.path.join(LOG_PATH, 'eval'))
+		#init_network_variable(sess,train_saver)
+		#train_writer = tf.summary.FileWriter(os.path.join(LOG_PATH, 'train'), sess.graph)
+		#eval_writer = tf.summary.FileWriter(os.path.join(LOG_PATH, 'eval'))
 		
 		#init_training thread
-		training_thread = threading.Thread(target=training, args=(sess,train_saver,train_writer,eval_writer,ops,))
-		training_thread.start()
+		#training_thread = threading.Thread(target=training, args=(sess,train_saver,train_writer,eval_writer,ops,))
+		#training_thread.start()
 
 		#start training
 		for ep in range(EPOCH):
@@ -841,7 +944,7 @@ def main():
 				
 			load_data_thread.join()
 		
-		training_thread.join()
+		#training_thread.join()
 						
 					
 if __name__ == "__main__":

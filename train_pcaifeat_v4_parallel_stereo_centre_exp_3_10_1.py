@@ -1,9 +1,9 @@
 import tensorflow as tf
 import numpy as np
 from loading_input import *
-from pointnetvlad.pointnetvlad_cls import *
+from pointnetvlad.pointnetattvlad_cls import *
 import pointnetvlad.loupe as lp
-import nets.resnetvlad_v1_50 as resnet
+import nets.resnetattvlad_v1_50 as resnet
 import shutil
 from multiprocessing.dummy import Pool as ThreadPool
 import threading
@@ -14,7 +14,7 @@ from camera_model import CameraModel
 from transform import build_se3_transform
 import matplotlib.pyplot as plt
 import tensorflow.contrib.slim as slim
-
+import math
 
 
 #thread pool
@@ -23,11 +23,11 @@ pool = ThreadPool(1)
 # is rand init 
 RAND_INIT = False
 # model path
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_10/model_00642214.ckpt"
+PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_10/model_00642214.ckpt"
+IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_10/model_00642214.ckpt"
 # log path
-LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_14_2"
+LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_10_1"
 # 1 for point cloud only, 2 for image only, 3 for pc&img&fc
 TRAINING_MODE = 3
 #TRAIN_ALL = True
@@ -59,9 +59,9 @@ MARGIN1 = 0.5
 MARGIN2 = 0.2
 
 #Train file index & pc img matching
-TRAIN_FILE = 'generate_queries/training_queries_RobotCar_day.pickle'
+TRAIN_FILE = 'generate_queries/training_queries_RobotCar.pickle'
 TRAINING_QUERIES = get_queries_dict(TRAIN_FILE)
-TEST_FILE = 'generate_queries/test_queries_RobotCar_day.pickle'
+TEST_FILE = 'generate_queries/test_queries_RobotCar.pickle'
 TEST_QUERIES = get_queries_dict(TEST_FILE)
 
 #cur_load for get_batch_keys
@@ -98,7 +98,7 @@ def channel_wise_attention(feature_map, weight_decay=0.00004, scope='', reuse=No
 		attended_fm = channel_wise_attention_fm * feature_map
 	
 	return attended_fm
-
+	
 def init_camera_model_posture():
 	global CAMERA_MODEL
 	global G_CAMERA_POSESOURCE
@@ -151,15 +151,15 @@ def init_pcnetwork(step):
 		pc_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,4096,3])
 		is_training_pl = tf.placeholder(tf.bool, shape=())
 		bn_decay = get_bn_decay(step)
-		pc_feat = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)
-		#pc_feat = tf.layers.dense(pc_feat_after_shape, EMBBED_SIZE,activation=tf.nn.relu)
+		pc_feat = pointnetnormattvlad(pc_placeholder,is_training_pl,bn_decay)
+		pc_feat = tf.nn.l2_normalize(pc_feat,1)
 	return pc_placeholder,is_training_pl,pc_feat
 	
 def init_fusion_network(pc_feat,img_feat,is_training=True):
 	with tf.variable_scope("fusion_var"):
 		pcai_feat = tf.concat((pc_feat,img_feat),axis=1)
-				
-		#pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
+		
+		pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
 		
 		pcai_feat = tf.nn.l2_normalize(pcai_feat,1)
 	return pcai_feat

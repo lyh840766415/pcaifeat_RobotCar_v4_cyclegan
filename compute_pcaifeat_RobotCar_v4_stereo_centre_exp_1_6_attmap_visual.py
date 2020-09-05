@@ -1,7 +1,8 @@
 import numpy as np
 from loading_input import *
-from lpdnet.lpd_FNSF import *
-import nets.resnetvlad_v1_50 as resnet
+from pointnetvlad.pointnetvlad_cls import *
+import pointnetvlad.loupe as lp
+import nets.resnetattvlad_v1_50_attmap as resnet
 import tensorflow as tf
 from time import *
 import pickle
@@ -9,29 +10,31 @@ from multiprocessing.dummy import Pool as ThreadPool
 sys.path.append('/data/lyh/lab/robotcar-dataset-sdk/python')
 from camera_model import CameraModel
 from transform import build_se3_transform
+import cv2
 
 #thread pool
 pool = ThreadPool(1)
 
 # 1 for point cloud only, 2 for image only, 3 for pc&img&fc
-TRAINING_MODE = 3
-BATCH_SIZE = 50
+TRAINING_MODE = 2
+BATCH_SIZE = 100
 EMBBED_SIZE = 1000
 
-DATABASE_FILE= 'generate_queries/oxford_evaluation_database_lpd.pickle'
-QUERY_FILE= 'generate_queries/oxford_evaluation_query_lpd.pickle'
+DATABASE_FILE= 'generate_queries/oxford_evaluation_database.pickle'
+QUERY_FILE= 'generate_queries/oxford_evaluation_query.pickle'
 DATABASE_SETS= get_sets_dict(DATABASE_FILE)
 QUERY_SETS= get_sets_dict(QUERY_FILE)
 
 #model_path & image path
 PC_MODEL_PATH = ""
-IMG_MODEL_PATH = ""
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_5/model_00642214.ckpt"
+IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_1_6/img_model_00858286.ckpt"
+MODEL_PATH = ""
 
 #camera model and posture
 CAMERA_MODEL = None
 G_CAMERA_POSESOURCE = None
 
+SAVED_ATTMAP = 0
 def init_camera_model_posture():
 	global CAMERA_MODEL
 	global G_CAMERA_POSESOURCE
@@ -131,9 +134,10 @@ def train_one_step(sess,ops,train_feed_dict):
 		return feat
 
 	if TRAINING_MODE == 2:
-		img_feat= sess.run([ops["img_feat"]],feed_dict = train_feed_dict)
+		img_feat,img_att_map= sess.run([ops["img_feat"],ops["img_att_map"]],feed_dict = train_feed_dict)
 		feat = {
-			"img_feat":img_feat[0]}
+			"img_feat":img_feat,
+			"img_att_map":img_att_map}
 		return feat
 		
 	if TRAINING_MODE == 3:
@@ -146,11 +150,11 @@ def train_one_step(sess,ops,train_feed_dict):
 		
 def init_all_feat():
 	if TRAINING_MODE != 2:
-		pc_feat = np.empty([0,256],dtype=np.float32)
+		pc_feat = np.empty([0,1000],dtype=np.float32)
 	if TRAINING_MODE != 1:
-		img_feat = np.empty([0,1000],dtype=np.float32)
+		img_feat = np.empty([0,256],dtype=np.float32)
 	if TRAINING_MODE == 3:
-		pcai_feat = np.empty([0,1256],dtype=np.float32)
+		pcai_feat = np.empty([0,3048],dtype=np.float32)
 	
 	if TRAINING_MODE == 1:
 		all_feat = {"pc_feat":pc_feat}
@@ -189,6 +193,7 @@ def get_unique_all_feat(all_feat,dict_to_process):
 	return all_feat
 		
 def get_latent_vectors(sess,ops,dict_to_process):
+	global SAVED_ATTMAP
 	print("dict_size = ",len(dict_to_process.keys()))
 	train_file_idxs = np.arange(0,len(dict_to_process.keys()))
 	all_feat = init_all_feat()
@@ -206,7 +211,7 @@ def get_latent_vectors(sess,ops,dict_to_process):
 		
 		begin_time = time()
 		
-		pc_data,img_data = load_img_pc_lpd(load_pc_filenames,load_img_filenames,pool)
+		pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool,True)
 		
 		end_time = time()
 		
@@ -218,6 +223,48 @@ def get_latent_vectors(sess,ops,dict_to_process):
 		feat = train_one_step(sess,ops,train_feed_dict)
 		end_time = time()
 		print ('feature time ',end_time - begin_time)
+		print(img_data.shape)
+		print(feat["img_att_map"].shape)
+		
+		img_att_map = feat["img_att_map"][7,:,:]
+		img_att_map = 255*(img_att_map-np.min(img_att_map))/(np.max(img_att_map) - np.min(img_att_map))
+		filename_img = "img_att_map/img_%05d.png"%(SAVED_ATTMAP)
+		filename_att = "img_att_map/att_%05d.png"%(SAVED_ATTMAP)
+		cv2.imwrite(filename_img,img_data[7,:,:,:])
+		cv2.imwrite(filename_att,img_att_map)
+		SAVED_ATTMAP = SAVED_ATTMAP + 1
+		
+		img_att_map = feat["img_att_map"][27,:,:]
+		img_att_map = 255*(img_att_map-np.min(img_att_map))/(np.max(img_att_map) - np.min(img_att_map))
+		filename_img = "img_att_map/img_%05d.png"%(SAVED_ATTMAP)
+		filename_att = "img_att_map/att_%05d.png"%(SAVED_ATTMAP)
+		cv2.imwrite(filename_img,img_data[27,:,:,:])
+		cv2.imwrite(filename_att,img_att_map)
+		SAVED_ATTMAP = SAVED_ATTMAP + 1
+		
+		img_att_map = feat["img_att_map"][37,:,:]
+		img_att_map = 255*(img_att_map-np.min(img_att_map))/(np.max(img_att_map) - np.min(img_att_map))
+		filename_img = "img_att_map/img_%05d.png"%(SAVED_ATTMAP)
+		filename_att = "img_att_map/att_%05d.png"%(SAVED_ATTMAP)
+		cv2.imwrite(filename_img,img_data[37,:,:,:])
+		cv2.imwrite(filename_att,img_att_map)
+		SAVED_ATTMAP = SAVED_ATTMAP + 1
+		
+		img_att_map = feat["img_att_map"][47,:,:]
+		img_att_map = 255*(img_att_map-np.min(img_att_map))/(np.max(img_att_map) - np.min(img_att_map))
+		filename_img = "img_att_map/img_%05d.png"%(SAVED_ATTMAP)
+		filename_att = "img_att_map/att_%05d.png"%(SAVED_ATTMAP)
+		cv2.imwrite(filename_img,img_data[47,:,:,:])
+		cv2.imwrite(filename_att,img_att_map)
+		SAVED_ATTMAP = SAVED_ATTMAP + 1
+		
+		img_att_map = feat["img_att_map"][57,:,:]
+		img_att_map = 255*(img_att_map-np.min(img_att_map))/(np.max(img_att_map) - np.min(img_att_map))
+		filename_img = "img_att_map/img_%05d.png"%(SAVED_ATTMAP)
+		filename_att = "img_att_map/att_%05d.png"%(SAVED_ATTMAP)
+		cv2.imwrite(filename_img,img_data[57,:,:,:])
+		cv2.imwrite(filename_att,img_att_map)
+		SAVED_ATTMAP = SAVED_ATTMAP + 1
 		
 		all_feat = concatnate_all_feat(all_feat,feat)
 		
@@ -232,7 +279,7 @@ def get_latent_vectors(sess,ops,dict_to_process):
 	
 	load_pc_filenames,load_img_filenames = get_load_batch_filename(dict_to_process,batch_keys,True,remind_index)
 	
-	pc_data,img_data = load_img_pc_lpd(load_pc_filenames,load_img_filenames,pool)
+	pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool,True)
 	
 	train_feed_dict = prepare_batch_data(pc_data,img_data,ops)
 	
@@ -310,21 +357,19 @@ def get_bn_decay(step):
 	bn_decay = tf.minimum(BN_DECAY_CLIP, 1 - bn_momentum)
 	return bn_decay
 
-def init_imgnetwork(is_training = False):
+
+def init_imgnetwork(is_training=False):
 	with tf.variable_scope("img_var"):
 		img_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,240,320,3])
-		img_feat = resnet.endpoints(img_placeholder,is_training=is_training)
-		
-		img_feat = tf.nn.l2_normalize(img_feat,1)
-	return img_placeholder, img_feat
-	
+		img_feat,img_att_map = resnet.endpoints(img_placeholder,is_training=is_training)
+	return img_placeholder, img_feat,img_att_map
 	
 def init_pcnetwork(step):
 	with tf.variable_scope("pc_var"):
-		pc_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,4096,13])
+		pc_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,4096,3])
 		is_training_pl = tf.placeholder(tf.bool, shape=())
 		bn_decay = get_bn_decay(step)
-		pc_feat = forward_att(pc_placeholder,is_training_pl,bn_decay)
+		pc_feat = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)	
 	return pc_placeholder,is_training_pl,pc_feat
 	
 	
@@ -344,14 +389,13 @@ def init_pcainetwork():
 	if TRAINING_MODE != 2:
 		pc_placeholder, is_training_pl, pc_feat = init_pcnetwork(step)
 	if TRAINING_MODE != 1:
-		img_placeholder, img_feat = init_imgnetwork()
+		img_placeholder, img_feat,img_att_map = init_imgnetwork()
 	if TRAINING_MODE == 3:
 		pcai_feat = init_fusion_network(pc_feat,img_feat)
 		
 	
 	print(img_feat)
-	print(pc_feat)
-	print(pcai_feat)
+
 
 	#output of pcainetwork init
 	if TRAINING_MODE == 1:
@@ -364,7 +408,8 @@ def init_pcainetwork():
 	if TRAINING_MODE == 2:
 		ops = {
 			"img_placeholder":img_placeholder,
-			"img_feat":img_feat}
+			"img_feat":img_feat,
+			"img_att_map":img_att_map}
 		return ops
 		
 	if TRAINING_MODE == 3:
@@ -401,7 +446,7 @@ def init_train_saver():
 	pc_variable = [v for v in variables if v.name.split('/')[0] =='pc_var']
 	img_variable = [v for v in variables if v.name.split('/')[0] =='img_var']
 	
-	pc_saver = tf.train.Saver(pc_variable)
+	pc_saver = None
 	img_saver = tf.train.Saver(img_variable)
 	
 	train_saver = {

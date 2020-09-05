@@ -1,9 +1,9 @@
 import tensorflow as tf
 import numpy as np
 from loading_input import *
-from pointnetvlad.pointnetvlad_cls import *
+from pointnetvlad.pointnet_cls import *
 import pointnetvlad.loupe as lp
-import nets.resnetvlad_v1_50 as resnet
+import nets.resnet_v1_50 as resnet
 import shutil
 from multiprocessing.dummy import Pool as ThreadPool
 import threading
@@ -13,23 +13,24 @@ sys.path.append('/data/lyh/lab/robotcar-dataset-sdk/python')
 from camera_model import CameraModel
 from transform import build_se3_transform
 import matplotlib.pyplot as plt
-import tensorflow.contrib.slim as slim
 
-
+from RandLANet.helper_tool import ConfigRobotCar as cfg
+from RandLANet import RandLANet
+from helper_tool import DataProcessing as DP
 
 #thread pool
 pool = ThreadPool(1)
 
 # is rand init 
-RAND_INIT = False
+RAND_INIT = True
 # model path
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_fusion/model_00180060.ckpt"
+PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_performance_compare/log/train_save_trans_exp_6_4/pc_model_00441147.ckpt"
+IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_performance_compare/log/train_save_trans_exp_6_5/img_model_00441147.ckpt"
 # log path
-LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_14_2"
+LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_randlanet"
 # 1 for point cloud only, 2 for image only, 3 for pc&img&fc
-TRAINING_MODE = 3
+TRAINING_MODE = 1
 #TRAIN_ALL = True
 ONLY_TRAIN_FUSION = False
 
@@ -59,9 +60,9 @@ MARGIN1 = 0.5
 MARGIN2 = 0.2
 
 #Train file index & pc img matching
-TRAIN_FILE = 'generate_queries/training_queries_RobotCar_day.pickle'
+TRAIN_FILE = 'generate_queries/training_queries_RobotCar.pickle'
 TRAINING_QUERIES = get_queries_dict(TRAIN_FILE)
-TEST_FILE = 'generate_queries/test_queries_RobotCar_day.pickle'
+TEST_FILE = 'generate_queries/test_queries_RobotCar.pickle'
 TEST_QUERIES = get_queries_dict(TEST_FILE)
 
 #cur_load for get_batch_keys
@@ -83,21 +84,6 @@ EP = 0
 #camera model and posture
 CAMERA_MODEL = None
 G_CAMERA_POSESOURCE = None
-
-def channel_wise_attention(feature_map, weight_decay=0.00004, scope='', reuse=None):
-	with tf.variable_scope(scope, 'ChannelWiseAttention', reuse=reuse):
-		# Tensorflow's tensor is in BHWC format. H for row split while W for column split.
-		_, C = tuple([int(x) for x in feature_map.get_shape()])
-		
-		w_s = tf.get_variable("ChannelWiseAttention_w_s", [C, C],dtype=tf.float32,initializer=tf.initializers.orthogonal,regularizer=tf.contrib.layers.l2_regularizer(weight_decay))
-		b_s = tf.get_variable("ChannelWiseAttention_b_s", [C],dtype=tf.float32,initializer=tf.initializers.zeros)
-		
-		#transpose_feature_map = tf.transpose(tf.reduce_mean(feature_map, [1, 2], keep_dims=True), perm=[0, 3, 1, 2])
-		channel_wise_attention_fm = tf.matmul(feature_map, w_s) + b_s
-		channel_wise_attention_fm = tf.nn.sigmoid(channel_wise_attention_fm)
-		attended_fm = channel_wise_attention_fm * feature_map
-	
-	return attended_fm
 
 def init_camera_model_posture():
 	global CAMERA_MODEL
@@ -139,29 +125,72 @@ def get_bn_decay(step):
 	bn_decay = tf.minimum(BN_DECAY_CLIP, 0.875)
 	return bn_decay
 
-def init_imgnetwork(is_training = True):
+def init_imgnetwork():
 	with tf.variable_scope("img_var"):
 		img_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,240,320,3])
-		img_feat = resnet.endpoints(img_placeholder,is_training=is_training)
-		img_feat = tf.nn.l2_normalize(img_feat,1)
+		_, img_feat_after_pooling, body_prefix = resnet.endpoints(img_placeholder,is_training=True)
+		#img_feat = tf.layers.dense(img_feat_after_pooling, EMBBED_SIZE,activation=tf.nn.relu)
+		img_feat = tf.nn.l2_normalize(img_feat_after_pooling,1)
 	return img_placeholder, img_feat
+	
+def knn_search(database,query,k):
+	#divided into batch
+	database_point_shape = database.get_shape()[1]
+	query_point_shape = query.get_shape()[1]
+	
+	database = tf.expand_dims(database,axis=1)
+	query = tf.expand_dims(query,axis=2)
+	database = tf.tile(database,multiples=[1,query_point_shape,1,1])
+	query = tf.tile(query,multiples=[1,1,database_point_shape,1])
+	
+	distance = query - database
+	distance = tf.reduce_sum(tf.square(distance),3)
+	_,top_k = tf.nn.top_k(distance,k)
+	return top_k
 	
 def init_pcnetwork(step):
 	with tf.variable_scope("pc_var"):
 		pc_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,4096,3])
 		is_training_pl = tf.placeholder(tf.bool, shape=())
-		bn_decay = get_bn_decay(step)
-		pc_feat = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)
-		#pc_feat = tf.layers.dense(pc_feat_after_shape, EMBBED_SIZE,activation=tf.nn.relu)
+		
+		input_points = []
+		input_neighbors = []
+		input_pools = []
+		input_up_samples = []
+		
+		batch_xyz = pc_placeholder
+		features = pc_placeholder
+		for i in range(cfg.num_layers):
+			neighbour_idx = knn_search(batch_xyz,batch_xyz,cfg.k_n)
+			sub_points = pc_placeholder[:, :tf.shape(batch_xyz)[1] // cfg.sub_sampling_ratio[i], :]
+			pool_i = neighbour_idx[:, :tf.shape(batch_xyz)[1] // cfg.sub_sampling_ratio[i], :]
+			up_i = knn_search(sub_points,batch_xyz,1)
+			
+			input_points.append(batch_xyz)
+			input_neighbors.append(neighbour_idx)
+			input_pools.append(pool_i)
+			input_up_samples.append(up_i)
+			batch_xyz = sub_points
+		
+		pc_dict = dict()
+		pc_dict['xyz'] = input_points
+		pc_dict['is_training'] = is_training_pl
+		pc_dict['neigh_idx'] = input_neighbors
+		pc_dict['sub_idx'] = input_pools
+		pc_dict['interp_idx'] = input_up_samples
+		pc_dict['features'] = features
+		
+		rand_net = RandLANet.Network(pc_dict, cfg)
+		pc_feat = rand_net.pc_feat
+		print(pc_feat)
+		
 	return pc_placeholder,is_training_pl,pc_feat
 	
-def init_fusion_network(pc_feat,img_feat,is_training=True):
+def init_fusion_network(pc_feat,img_feat):
 	with tf.variable_scope("fusion_var"):
 		pcai_feat = tf.concat((pc_feat,img_feat),axis=1)
-				
-		#pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
-		
-		pcai_feat = tf.nn.l2_normalize(pcai_feat,1)
+		#pcai_feat = tf.layers.dense(concat_feat,EMBBED_SIZE,activation=tf.nn.relu)
+		print(pcai_feat)
 	return pcai_feat
 
 def init_pcainetwork():
@@ -175,10 +204,6 @@ def init_pcainetwork():
 		img_placeholder, img_feat = init_imgnetwork()
 	if TRAINING_MODE == 3:
 		pcai_feat = init_fusion_network(pc_feat,img_feat)
-	
-	print(pc_feat)
-	print(img_feat)
-	print(pcai_feat)
 	
 	#prepare data and loss
 	if TRAINING_MODE != 2:
@@ -390,17 +415,17 @@ def prepare_batch_data(pc_data,img_data,feat_batch,ops,ep):
 def train_one_step(sess,ops,train_feed_dict,train_writer,is_training = True):
 	global STEP
 	if not is_training:
-		summary,step,all_loss = sess.run([ops["merged"],ops["step"],ops["all_loss"]],feed_dict = train_feed_dict)
+		summary,step,all_loss = sess.run([ops["merged"],ops["step"],ops["pc_loss"]],feed_dict = train_feed_dict)
 		train_writer.add_summary(summary, step)
 		return step,all_loss
 	
 	if TRAINING_MODE == 1:
-		summary,step,pc_loss,_,= sess.run([ops["merged"],ops["step"],ops["pc_loss"],ops["pc_train_op"]],feed_dict = train_feed_dict)
-		print("batch num = %d , pc_loss = %f"%(step, pc_loss))
+		summary,step,all_loss,_,= sess.run([ops["merged"],ops["step"],ops["pc_loss"],ops["pc_train_op"]],feed_dict = train_feed_dict)
+		print("batch num = %d , pc_loss = %f"%(step, all_loss))
 
 	if TRAINING_MODE == 2:
-		summary,step,img_loss,_,= sess.run([ops["merged"],ops["step"],ops["img_loss"],ops["img_train_op"]],feed_dict = train_feed_dict)
-		print("batch num = %d , img_loss = %f"%(step, img_loss))
+		summary,step,all_loss,_,= sess.run([ops["merged"],ops["step"],ops["img_loss"],ops["img_train_op"]],feed_dict = train_feed_dict)
+		print("batch num = %d , img_loss = %f"%(step, all_loss))
 	
 	if TRAINING_MODE == 3:
 		if ONLY_TRAIN_FUSION:

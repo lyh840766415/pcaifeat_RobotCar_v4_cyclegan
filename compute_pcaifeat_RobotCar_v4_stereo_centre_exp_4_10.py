@@ -1,7 +1,7 @@
 import numpy as np
 from loading_input import *
 from lpdnet.lpd_FNSF import *
-import nets.resnetvlad_v1_50 as resnet
+import nets.resnetattvlad_v1_50 as resnet
 import tensorflow as tf
 from time import *
 import pickle
@@ -18,15 +18,15 @@ TRAINING_MODE = 3
 BATCH_SIZE = 50
 EMBBED_SIZE = 1000
 
-DATABASE_FILE= 'generate_queries/oxford_evaluation_database_lpd.pickle'
-QUERY_FILE= 'generate_queries/oxford_evaluation_query_lpd.pickle'
+DATABASE_FILE= 'generate_queries/oxford_evaluation_database_lpd_day.pickle'
+QUERY_FILE= 'generate_queries/oxford_evaluation_query_lpd_day.pickle'
 DATABASE_SETS= get_sets_dict(DATABASE_FILE)
 QUERY_SETS= get_sets_dict(QUERY_FILE)
 
 #model_path & image path
 PC_MODEL_PATH = ""
 IMG_MODEL_PATH = ""
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_5/model_00642214.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_10/model_00642214.ckpt"
 
 #camera model and posture
 CAMERA_MODEL = None
@@ -148,9 +148,9 @@ def init_all_feat():
 	if TRAINING_MODE != 2:
 		pc_feat = np.empty([0,256],dtype=np.float32)
 	if TRAINING_MODE != 1:
-		img_feat = np.empty([0,1000],dtype=np.float32)
+		img_feat = np.empty([0,256],dtype=np.float32)
 	if TRAINING_MODE == 3:
-		pcai_feat = np.empty([0,1256],dtype=np.float32)
+		pcai_feat = np.empty([0,512],dtype=np.float32)
 	
 	if TRAINING_MODE == 1:
 		all_feat = {"pc_feat":pc_feat}

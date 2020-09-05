@@ -1,20 +1,22 @@
 import tensorflow as tf
 import numpy as np
 from loading_input import *
-from pointnetvlad.pointnetvlad_cls import *
-import pointnetvlad.loupe as lp
-import nets.resnetvlad_v1_50 as resnet
+#from pointnetvlad.pointnetvlad_cls import *
+#import pointnetvlad.loupe as lp
+from lpdnet.lpd_FNSF import *
+import nets.resnetattvlad_v1_50 as resnet
 import shutil
 from multiprocessing.dummy import Pool as ThreadPool
 import threading
 import time
+import sys
 import cv2
 sys.path.append('/data/lyh/lab/robotcar-dataset-sdk/python')
 from camera_model import CameraModel
 from transform import build_se3_transform
 import matplotlib.pyplot as plt
 import tensorflow.contrib.slim as slim
-
+import math
 
 
 #thread pool
@@ -23,11 +25,11 @@ pool = ThreadPool(1)
 # is rand init 
 RAND_INIT = False
 # model path
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
-IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_8/model_00642214.ckpt"
+PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_8/model_00642214.ckpt"
+IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_8/model_00642214.ckpt"
 # log path
-LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_14_2"
+LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_8_1"
 # 1 for point cloud only, 2 for image only, 3 for pc&img&fc
 TRAINING_MODE = 3
 #TRAIN_ALL = True
@@ -59,9 +61,9 @@ MARGIN1 = 0.5
 MARGIN2 = 0.2
 
 #Train file index & pc img matching
-TRAIN_FILE = 'generate_queries/training_queries_RobotCar_day.pickle'
+TRAIN_FILE = 'generate_queries/training_queries_RobotCar_lpd.pickle'
 TRAINING_QUERIES = get_queries_dict(TRAIN_FILE)
-TEST_FILE = 'generate_queries/test_queries_RobotCar_day.pickle'
+TEST_FILE = 'generate_queries/test_queries_RobotCar_lpd.pickle'
 TEST_QUERIES = get_queries_dict(TEST_FILE)
 
 #cur_load for get_batch_keys
@@ -98,7 +100,7 @@ def channel_wise_attention(feature_map, weight_decay=0.00004, scope='', reuse=No
 		attended_fm = channel_wise_attention_fm * feature_map
 	
 	return attended_fm
-
+	
 def init_camera_model_posture():
 	global CAMERA_MODEL
 	global G_CAMERA_POSESOURCE
@@ -143,23 +145,24 @@ def init_imgnetwork(is_training = True):
 	with tf.variable_scope("img_var"):
 		img_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,240,320,3])
 		img_feat = resnet.endpoints(img_placeholder,is_training=is_training)
+		
 		img_feat = tf.nn.l2_normalize(img_feat,1)
 	return img_placeholder, img_feat
 	
 def init_pcnetwork(step):
 	with tf.variable_scope("pc_var"):
-		pc_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,4096,3])
+		pc_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BATCH_SIZE*BATCH_DATA_SIZE,4096,13])
 		is_training_pl = tf.placeholder(tf.bool, shape=())
 		bn_decay = get_bn_decay(step)
-		pc_feat = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)
+		pc_feat = forward_att(pc_placeholder,is_training_pl,bn_decay)
 		#pc_feat = tf.layers.dense(pc_feat_after_shape, EMBBED_SIZE,activation=tf.nn.relu)
 	return pc_placeholder,is_training_pl,pc_feat
 	
 def init_fusion_network(pc_feat,img_feat,is_training=True):
 	with tf.variable_scope("fusion_var"):
 		pcai_feat = tf.concat((pc_feat,img_feat),axis=1)
-				
-		#pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
+		
+		pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
 		
 		pcai_feat = tf.nn.l2_normalize(pcai_feat,1)
 	return pcai_feat
@@ -175,10 +178,6 @@ def init_pcainetwork():
 		img_placeholder, img_feat = init_imgnetwork()
 	if TRAINING_MODE == 3:
 		pcai_feat = init_fusion_network(pc_feat,img_feat)
-	
-	print(pc_feat)
-	print(img_feat)
-	print(pcai_feat)
 	
 	#prepare data and loss
 	if TRAINING_MODE != 2:
@@ -336,8 +335,8 @@ def init_network_variable(sess,train_saver):
 def init_train_saver():
 	all_saver = tf.train.Saver()
 	variables = tf.contrib.framework.get_variables_to_restore()	
-	
-	pc_variable = [v for v in variables if v.name.split('/')[0] =='pc_var']
+		
+	pc_variable = [v for v in variables if v.name.split('/')[0] =='pc_var' and v.name.split('/')[1] != 'point_attention']
 	img_variable = [v for v in variables if v.name.split('/')[0] =='img_var']
 	#img_variable = [v for v in variables if v.name.split('/')[0] =='img_var' and v.name.split('/')[1] == 'resnet_v1_50']
 	
@@ -619,27 +618,28 @@ def get_eval_keys():
 	eval_load = 0
 	while len(load_batch_keys) < FEAT_BATCH_SIZE:			
 		cur_key = eval_file_idxs[eval_load]
-				
+		
 		if len(TEST_QUERIES[cur_key]["positives"]) < POS_NUM:
 			eval_load = eval_load + 1
 			continue
 		
 		filename = "%s_stereo_centre.png"%(TEST_QUERIES[cur_key]["query"][:-4])
+			
 		if not os.path.exists(filename):
 			#print(TRAINING_QUERIES[cur_key]["query"])
 			eval_load = eval_load + 1
 			continue
-		
+			
 		valid_pos = 0
 		for i in range(len(TEST_QUERIES[cur_key]["positives"])):
 			filename = "%s_stereo_centre.png"%(TEST_QUERIES[TEST_QUERIES[cur_key]["positives"][i]]["query"][:-4])
 			if os.path.exists(filename):
 					valid_pos = valid_pos + 1
-				
+		
 		if valid_pos < POS_NUM:
 			eval_load = eval_load + 1
 			continue
-						
+				
 		load_batch_keys.append(eval_file_idxs[eval_load])
 		eval_load = eval_load + 1
 		
@@ -706,7 +706,7 @@ def load_data(train_file_idxs):
 			#select load_batch tuple
 			eval_pc_filenames,eval_img_filenames = get_eval_batch_filename(eval_batch_key,quadruplet)
 			#load pc&img data from file
-			pc_data,img_data = load_img_pc(eval_pc_filenames,eval_img_filenames,pool,True)
+			pc_data,img_data = load_img_pc_lpd(eval_pc_filenames,eval_img_filenames,pool)
 			
 			print("load evaluate batch",cnt)
 		else:	
@@ -718,8 +718,7 @@ def load_data(train_file_idxs):
 			load_pc_filenames,load_img_filenames = get_load_batch_filename(load_batch_keys,quadruplet)
 		
 			#load pc&img data from file
-			#pc_data,img_data = load_img_pc_from_net(load_pc_filenames,load_img_filenames,pool)
-			pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool,True)
+			pc_data,img_data = load_img_pc_lpd(load_pc_filenames,load_img_filenames,pool)
 			print("load training batch",cnt)
 		
 		TRAINING_DATA_LOCK.acquire()

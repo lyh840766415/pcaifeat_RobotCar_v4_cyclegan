@@ -1,7 +1,7 @@
 import numpy as np
 from loading_input import *
 from lpdnet.lpd_FNSF import *
-import nets.resnetvlad_v1_50 as resnet
+import nets.resnetattvlad_v1_50 as resnet
 import tensorflow as tf
 from time import *
 import pickle
@@ -26,11 +26,26 @@ QUERY_SETS= get_sets_dict(QUERY_FILE)
 #model_path & image path
 PC_MODEL_PATH = ""
 IMG_MODEL_PATH = ""
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_5/model_00642214.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_8_1/model_00642214.ckpt"
 
 #camera model and posture
 CAMERA_MODEL = None
 G_CAMERA_POSESOURCE = None
+
+def channel_wise_attention(feature_map, weight_decay=0.00004, scope='', reuse=None):
+	with tf.variable_scope(scope, 'ChannelWiseAttention', reuse=reuse):
+		# Tensorflow's tensor is in BHWC format. H for row split while W for column split.
+		_, C = tuple([int(x) for x in feature_map.get_shape()])
+		
+		w_s = tf.get_variable("ChannelWiseAttention_w_s", [C, C],dtype=tf.float32,initializer=tf.initializers.orthogonal,regularizer=tf.contrib.layers.l2_regularizer(weight_decay))
+		b_s = tf.get_variable("ChannelWiseAttention_b_s", [C],dtype=tf.float32,initializer=tf.initializers.zeros)
+		
+		#transpose_feature_map = tf.transpose(tf.reduce_mean(feature_map, [1, 2], keep_dims=True), perm=[0, 3, 1, 2])
+		channel_wise_attention_fm = tf.matmul(feature_map, w_s) + b_s
+		channel_wise_attention_fm = tf.nn.sigmoid(channel_wise_attention_fm)
+		attended_fm = channel_wise_attention_fm * feature_map
+	
+	return attended_fm
 
 def init_camera_model_posture():
 	global CAMERA_MODEL
@@ -148,9 +163,9 @@ def init_all_feat():
 	if TRAINING_MODE != 2:
 		pc_feat = np.empty([0,256],dtype=np.float32)
 	if TRAINING_MODE != 1:
-		img_feat = np.empty([0,1000],dtype=np.float32)
+		img_feat = np.empty([0,256],dtype=np.float32)
 	if TRAINING_MODE == 3:
-		pcai_feat = np.empty([0,1256],dtype=np.float32)
+		pcai_feat = np.empty([0,512],dtype=np.float32)
 	
 	if TRAINING_MODE == 1:
 		all_feat = {"pc_feat":pc_feat}
@@ -331,8 +346,10 @@ def init_pcnetwork(step):
 def init_fusion_network(pc_feat,img_feat):
 	with tf.variable_scope("fusion_var"):
 		pcai_feat = tf.concat((pc_feat,img_feat),axis=1)
-		#pcai_feat = tf.layers.dense(concat_feat,EMBBED_SIZE,activation=tf.nn.relu)
-		print(pcai_feat)
+		
+		#pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
+		
+		pcai_feat = tf.nn.l2_normalize(pcai_feat,1)
 	return pcai_feat
 	
 	

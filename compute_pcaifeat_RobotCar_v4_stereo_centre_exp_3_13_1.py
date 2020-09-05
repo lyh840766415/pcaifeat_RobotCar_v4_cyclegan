@@ -349,7 +349,7 @@ def init_fusion_network(pc_feat,img_feat,is_training=False):
 	with tf.variable_scope("fusion_var"):
 		pcai_feat = tf.concat((pc_feat,img_feat),axis=1)
 		
-		pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
+		#pcai_feat = channel_wise_attention(pcai_feat, weight_decay=0.00004, scope='', reuse=None)
 		
 		pcai_feat = tf.nn.l2_normalize(pcai_feat,1)
 		print(pcai_feat)

@@ -1,6 +1,7 @@
 import numpy as np
 from loading_input import *
-from lpdnet.lpd_FNSF import *
+from pointnetvlad.pointnetvlad_cls import *
+import pointnetvlad.loupe as lp
 import nets.resnetvlad_v1_50 as resnet
 import tensorflow as tf
 from time import *
@@ -9,24 +10,26 @@ from multiprocessing.dummy import Pool as ThreadPool
 sys.path.append('/data/lyh/lab/robotcar-dataset-sdk/python')
 from camera_model import CameraModel
 from transform import build_se3_transform
+import tensorflow.contrib.slim as slim
+
 
 #thread pool
 pool = ThreadPool(1)
 
 # 1 for point cloud only, 2 for image only, 3 for pc&img&fc
 TRAINING_MODE = 3
-BATCH_SIZE = 50
+BATCH_SIZE = 20
 EMBBED_SIZE = 1000
 
-DATABASE_FILE= 'generate_queries/oxford_evaluation_database_lpd.pickle'
-QUERY_FILE= 'generate_queries/oxford_evaluation_query_lpd.pickle'
+DATABASE_FILE= 'generate_queries/oxford_evaluation_database.pickle'
+QUERY_FILE= 'generate_queries/oxford_evaluation_query.pickle'
 DATABASE_SETS= get_sets_dict(DATABASE_FILE)
 QUERY_SETS= get_sets_dict(QUERY_FILE)
 
 #model_path & image path
 PC_MODEL_PATH = ""
 IMG_MODEL_PATH = ""
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_4_5/model_00642214.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v4_cyclegan/log/train_save_trans_exp_3_11/model_00642214.ckpt"
 
 #camera model and posture
 CAMERA_MODEL = None
@@ -146,11 +149,11 @@ def train_one_step(sess,ops,train_feed_dict):
 		
 def init_all_feat():
 	if TRAINING_MODE != 2:
-		pc_feat = np.empty([0,256],dtype=np.float32)
+		pc_feat = np.empty([0,1000],dtype=np.float32)
 	if TRAINING_MODE != 1:
 		img_feat = np.empty([0,1000],dtype=np.float32)
 	if TRAINING_MODE == 3:
-		pcai_feat = np.empty([0,1256],dtype=np.float32)
+		pcai_feat = np.empty([0,2000],dtype=np.float32)
 	
 	if TRAINING_MODE == 1:
 		all_feat = {"pc_feat":pc_feat}
@@ -206,7 +209,7 @@ def get_latent_vectors(sess,ops,dict_to_process):
 		
 		begin_time = time()
 		
-		pc_data,img_data = load_img_pc_lpd(load_pc_filenames,load_img_filenames,pool)
+		pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool,True)
 		
 		end_time = time()
 		
@@ -232,7 +235,7 @@ def get_latent_vectors(sess,ops,dict_to_process):
 	
 	load_pc_filenames,load_img_filenames = get_load_batch_filename(dict_to_process,batch_keys,True,remind_index)
 	
-	pc_data,img_data = load_img_pc_lpd(load_pc_filenames,load_img_filenames,pool)
+	pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool,True)
 	
 	train_feed_dict = prepare_batch_data(pc_data,img_data,ops)
 	
@@ -310,28 +313,42 @@ def get_bn_decay(step):
 	bn_decay = tf.minimum(BN_DECAY_CLIP, 1 - bn_momentum)
 	return bn_decay
 
+
 def init_imgnetwork(is_training = False):
 	with tf.variable_scope("img_var"):
 		img_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,240,320,3])
 		img_feat = resnet.endpoints(img_placeholder,is_training=is_training)
-		
 		img_feat = tf.nn.l2_normalize(img_feat,1)
-	return img_placeholder, img_feat
-	
-	
+		return img_placeholder, img_feat
+		
+		
 def init_pcnetwork(step):
 	with tf.variable_scope("pc_var"):
-		pc_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,4096,13])
+		pc_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,4096,3])
 		is_training_pl = tf.placeholder(tf.bool, shape=())
 		bn_decay = get_bn_decay(step)
-		pc_feat = forward_att(pc_placeholder,is_training_pl,bn_decay)
+		pc_feat = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)	
 	return pc_placeholder,is_training_pl,pc_feat
 	
 	
-def init_fusion_network(pc_feat,img_feat):
+def init_fusion_network(pc_feat,img_feat,is_training=False):
 	with tf.variable_scope("fusion_var"):
 		pcai_feat = tf.concat((pc_feat,img_feat),axis=1)
 		#pcai_feat = tf.layers.dense(concat_feat,EMBBED_SIZE,activation=tf.nn.relu)
+		
+		'''
+		pcai_feat = tf.contrib.layers.batch_norm(pcai_feat,center=True, scale=True, is_training=is_training,scope='bn')
+		input_dim = pcai_feat.get_shape().as_list()[1] 
+		gating_weights = tf.get_variable("gating_weights",[input_dim, input_dim],initializer = tf.random_normal_initializer(stddev=1 / math.sqrt(input_dim)))	
+		
+		gates = tf.matmul(pcai_feat, gating_weights)
+		gates = slim.batch_norm(gates,center=True,scale=True,is_training=is_training,scope="gating_bn")
+		
+		gates = tf.sigmoid(gates)
+		pcai_feat = tf.multiply(pcai_feat,gates)
+		'''
+		
+		pcai_feat = tf.nn.l2_normalize(pcai_feat,1)
 		print(pcai_feat)
 	return pcai_feat
 	
@@ -352,7 +369,8 @@ def init_pcainetwork():
 	print(img_feat)
 	print(pc_feat)
 	print(pcai_feat)
-
+	
+	
 	#output of pcainetwork init
 	if TRAINING_MODE == 1:
 		ops = {

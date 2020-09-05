@@ -72,7 +72,17 @@ def load_pc_file_lpd(filename):
 	pc[np.isinf(pc)] = 1.0
 
 	return pc
+
+def load_kdtree(filename):
+	if not os.path.exists(filename):
+		print(filename)
+		exit()
 	
+	with open(filename, 'rb') as f:
+		kdtree = pickle.load(f)
+	return kdtree
+	
+		
 def load_pc_file_64(filename):
 	if not os.path.exists(filename):
 		print(filename)
@@ -194,6 +204,24 @@ def load_img_pc(load_pc_filenames,load_img_filenames,pool,pc_64bit):
 		imgs=np.array(imgs)
 
 	return pcs,imgs
+
+def load_img_pc_kdtree(load_pc_filenames,load_kdtree_filenames,load_img_filenames,pool,pc_64bit):
+	pcs = []
+	imgs = []
+	if load_pc_filenames != None:
+		if pc_64bit:
+			pcs = pool.map(load_pc_file_64,load_pc_filenames)
+		else:
+			pcs = pool.map(load_pc_file_32,load_pc_filenames)
+		pcs = np.array(pcs)
+	if load_img_filenames != None:
+		imgs = pool.map(load_image,load_img_filenames)
+		imgs=np.array(imgs)
+	if load_kdtree_filenames != None:
+		kdtrees = pool.map(load_kdtree,load_kdtree_filenames)
+		kdtrees = np.array(kdtrees)
+
+	return pcs,kdtrees,imgs
 
 def load_img_pc_from_net(load_pc_filenames,load_img_filenames,pool,pc_64bit):
 	pcs = []
